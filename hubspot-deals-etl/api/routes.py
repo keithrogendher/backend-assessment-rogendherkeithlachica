@@ -18,6 +18,7 @@ from .schemas import (
     ScanConfig
 )
 from services.extraction_service import ExtractionService
+from services.hubspot_api_service import APIService
 from config import get_config
 from loki_logger import get_logger, log_business_event, log_security_event
 
@@ -716,6 +717,51 @@ def create_api():
                     "success": False,
                     "message": f"Failed to remove scan: {str(e)}",
                     "error": str(e)
+                }, 500
+
+    @api.route('/key/verify')
+    class KeyVerify(Resource):
+        def get(self):
+            """Validate a HubSpot access token via the HubSpot API."""
+            request_id = getattr(g, 'request_id', str(uuid.uuid4()))
+            access_token = request.args.get('accessToken') or request.args.get('access_token')
+
+            if not access_token:
+                return {
+                    "success": False,
+                    "message": "accessToken query parameter is required",
+                    "error": "accessToken query parameter is required",
+                }, 400
+
+            try:
+                api_service = APIService()
+                valid = api_service.validate_token(access_token)
+
+                logger.info(
+                    "HubSpot key verification completed",
+                    extra={
+                        'request_id': request_id,
+                        'valid': valid,
+                    },
+                )
+
+                return {
+                    "success": True,
+                    "data": {
+                        "valid": valid,
+                        "message": "HubSpot access token is valid" if valid else "HubSpot access token is invalid",
+                    },
+                }
+            except Exception as e:
+                logger.error(
+                    "HubSpot key verification failed",
+                    extra={'request_id': request_id, 'error': str(e)},
+                    exc_info=True,
+                )
+                return {
+                    "success": False,
+                    "message": f"Failed to verify HubSpot key: {str(e)}",
+                    "error": str(e),
                 }, 500
 
     @api.route('/stats')

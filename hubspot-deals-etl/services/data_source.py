@@ -1,10 +1,11 @@
+import os
 import dlt
 import logging
 from typing import Dict, List, Any, Iterator, Optional, Callable
 from datetime import datetime, timezone
 from .api_service import APIService
 from loki_logger import get_logger, log_business_event, log_security_event
-from .api_service import APIService
+from . import kafka_producer
 
 def create_data_source(
     job_config: Dict[str, Any],
@@ -21,13 +22,16 @@ def create_data_source(
     logger = get_logger(__name__)
     api_service = APIService(base_url="https://api.hubapi.com" , test_delay_seconds=1)
 
-    access_token = auth_config.get("accessToken")
+    access_token = auth_config.get("accessToken") or auth_config.get("access_token") or os.environ.get("HUBSPOT_ACCESS_TOKEN")
     if not access_token:
         raise ValueError("No access token found in auth configuration")
 
     organization_id = job_config.get("organizationId")
     if not organization_id:
         raise ValueError("No organization ID found in job configuration")
+
+    # Initialize Kafka producer for event streaming
+    kafka_prod = kafka_producer.create_kafka_producer()
 
     #  To Be Removed Later
     logger.info(
@@ -78,6 +82,16 @@ def create_data_source(
         cancel_check_interval = 1
         pause_check_interval = 1  # Check for pause more frequently than cancel
         job_id = filters.get("scan_id", "unknown")
+        object_type = filters.get("objectType") or filters.get("object_type") or "deals"
+        properties = filters.get("properties") or None
+        search_filters = {}
+        last_modified_date = (
+            filters.get("last_modified_date")
+            or filters.get("lastModifiedDate")
+            or filters.get("lastmodifieddate")
+        )
+        if last_modified_date:
+            search_filters["last_modified_date"] = last_modified_date
 
         while page_count < 1000:  # Safety limit
             try:
@@ -93,6 +107,25 @@ def create_data_source(
                                 "total_processed": total_records,
                             },
                         )
+
+                        # Emit cancellation event to Kafka
+                        if kafka_prod:
+                            try:
+                                kafka_prod.publish_extraction_event(
+                                    scan_id=job_id,
+                                    organization_id=organization_id,
+                                    event_type="cancelled",
+                                    metadata={
+                                        "records_processed": total_records,
+                                        "page_stopped_at": page_count + 1,
+                                        "object_type": object_type,
+                                    }
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "Failed to publish cancellation event to Kafka",
+                                    extra={"job_id": job_id, "error": str(e)}
+                                )
 
                         # Save cancellation checkpoint
                         if checkpoint_callback:
@@ -129,6 +162,26 @@ def create_data_source(
                                 "total_processed": total_records,
                             },
                         )
+
+                        # Emit pause event to Kafka
+                        if kafka_prod:
+                            try:
+                                kafka_prod.publish_extraction_event(
+                                    scan_id=job_id,
+                                    organization_id=organization_id,
+                                    event_type="paused",
+                                    metadata={
+                                        "records_processed": total_records,
+                                        "page_paused_at": page_count + 1,
+                                        "resumable": True,
+                                        "object_type": object_type,
+                                    }
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "Failed to publish pause event to Kafka",
+                                    extra={"job_id": job_id, "error": str(e)}
+                                )
 
                         # Save pause checkpoint - this allows resuming from exact position
                         if checkpoint_callback:
@@ -177,9 +230,15 @@ def create_data_source(
                     },
                 )
 
-                # Fetch deals page from HubSpot CRM API
+                # Fetch HubSpot objects page from the CRM search API
                 data = api_service.get_data(
-                    access_token=access_token, limit=100, after=after,
+                    access_token=access_token,
+                    limit=100,
+                    after=after,
+                    object_type=object_type,
+                    search_mode=True,
+                    filters=search_filters,
+                    properties=properties,
                 )
 
                 page_records = 0
@@ -325,6 +384,25 @@ def create_data_source(
                         yield filtered_record
                         page_records += 1
 
+                        # Emit to Kafka for real-time streaming (if enabled)
+                        if kafka_prod:
+                            try:
+                                kafka_prod.publish_hubspot_object(
+                                    scan_id=filters.get("scan_id", "unknown"),
+                                    organization_id=organization_id,
+                                    object_type=object_type,
+                                    hubspot_object=record  # Send original HubSpot object with properties
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "Failed to emit object to Kafka",
+                                    extra={
+                                        "scan_id": filters.get("scan_id"),
+                                        "object_id": record.get("id"),
+                                        "error": str(e)
+                                    }
+                                )
+
                 # Update counters
                 total_records += page_records
                 page_count += 1
@@ -420,6 +498,25 @@ def create_data_source(
                             "total_pages": page_count,
                         },
                     )
+
+                    # Emit completion event to Kafka
+                    if kafka_prod:
+                        try:
+                            kafka_prod.publish_extraction_event(
+                                scan_id=job_id,
+                                organization_id=organization_id,
+                                event_type="completed",
+                                metadata={
+                                    "total_records": total_records,
+                                    "total_pages": page_count,
+                                    "object_type": object_type,
+                                }
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to publish completion event to Kafka",
+                                extra={"job_id": job_id, "error": str(e)}
+                            )
                     break
 
             except Exception as e:

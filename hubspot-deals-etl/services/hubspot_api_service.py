@@ -1,3 +1,4 @@
+import os
 import requests
 import logging
 from typing import Dict, List, Optional, Any
@@ -17,6 +18,7 @@ class APIService:
         self.test_delay_seconds = test_delay_seconds  # Add configurable delay for testing
         self.logger = get_logger(__name__)
         self.session = requests.Session()
+        self.default_object_type = os.environ.get("HUBSPOT_OBJECT_TYPE", "deals")
         
         # Set default headers
         self.session.headers.update({
@@ -40,7 +42,175 @@ class APIService:
             'Authorization': f'Bearer {token}'
         })
         self.logger.debug("Access token set", extra={'operation': 'token_set'})
+
+    def _resolve_access_token(self, access_token: Optional[str] = None) -> str:
+        """Resolve the access token from argument or environment."""
+        token = access_token or os.environ.get("HUBSPOT_ACCESS_TOKEN")
+        if not token:
+            raise ValueError("No HubSpot access token configured")
+        return token
+
+    def search_objects(
+        self,
+        access_token: Optional[str],
+        object_type: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None,
+        limit: int = 100,
+        after: Optional[str] = None,
+        properties: Optional[List[str]] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Use HubSpot's CRM search API with cursor-based pagination."""
+        resolved_token = self._resolve_access_token(access_token)
+        object_type = (object_type or self.default_object_type or "deals").strip().lower()
+        start_time = datetime.utcnow()
+
+        try:
+            headers = {
+                'Authorization': f'Bearer {resolved_token}',
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+            }
+
+            payload: Dict[str, Any] = {
+                'limit': min(limit, 100),
+            }
+
+            if after is not None:
+                payload['after'] = after
+
+            if properties:
+                payload['properties'] = list(properties)
+
+            filter_groups: List[Dict[str, Any]] = []
+            if filters:
+                last_modified = filters.get('last_modified_date') or filters.get('lastModifiedDate') or filters.get('lastmodifieddate')
+                if last_modified:
+                    filter_groups.append({
+                        'filters': [{
+                            'propertyName': 'lastmodifieddate',
+                            'operator': 'GTE',
+                            'value': str(last_modified),
+                        }]
+                    })
+
+            if filter_groups:
+                payload['filterGroups'] = filter_groups
+
+            url = f"{self.base_url}/crm/v3/objects/{object_type}/search"
+            response = self.session.post(url, json=payload, headers=headers)
+
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 1))
+                self.logger.warning(
+                    "HubSpot search rate limited, retrying",
+                    extra={
+                        'operation': 'search_objects',
+                        'retry_after': retry_after,
+                        'status_code': 429,
+                    },
+                )
+                time.sleep(retry_after)
+                response = self.session.post(url, json=payload, headers=headers)
+
+            response.raise_for_status()
+            result = response.json()
+
+            duration_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
+            self.logger.info(
+                "HubSpot search successful",
+                extra={
+                    'operation': 'search_objects',
+                    'status_code': response.status_code,
+                    'duration_ms': round(duration_ms, 2),
+                    'object_type': object_type,
+                    'result_count': len(result.get('results', [])),
+                    'has_more': result.get('paging', {}).get('next') is not None,
+                },
+            )
+
+            return result
+
+        except requests.exceptions.RequestException as e:
+            duration_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
+            self.logger.error(
+                "HubSpot search failed",
+                extra={
+                    'operation': 'search_objects',
+                    'error': str(e),
+                    'duration_ms': round(duration_ms, 2),
+                    'status_code': getattr(e.response, 'status_code', None) if hasattr(e, 'response') else None,
+                },
+                exc_info=True,
+            )
+            raise
     
+    def get_associations(
+        self,
+        access_token: Optional[str],
+        from_object_type: str,
+        to_object_type: str,
+        object_ids: List[str],
+    ) -> Dict[str, Any]:
+        """Read associations for a batch of HubSpot object IDs."""
+        resolved_token = self._resolve_access_token(access_token)
+        start_time = datetime.utcnow()
+
+        try:
+            headers = {
+                'Authorization': f'Bearer {resolved_token}',
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+            }
+            payload = {
+                'inputs': [{"id": object_id} for object_id in object_ids[:100]],
+            }
+            url = f"{self.base_url}/crm/v3/associations/{from_object_type}/{to_object_type}/batch/read"
+            response = self.session.post(url, json=payload, headers=headers)
+
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 1))
+                self.logger.warning(
+                    "HubSpot associations rate limited, retrying",
+                    extra={
+                        'operation': 'get_associations',
+                        'retry_after': retry_after,
+                        'status_code': 429,
+                    },
+                )
+                time.sleep(retry_after)
+                response = self.session.post(url, json=payload, headers=headers)
+
+            response.raise_for_status()
+            result = response.json()
+
+            duration_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
+            self.logger.info(
+                "HubSpot associations fetched",
+                extra={
+                    'operation': 'get_associations',
+                    'status_code': response.status_code,
+                    'duration_ms': round(duration_ms, 2),
+                    'input_count': len(payload['inputs']),
+                },
+            )
+
+            return result
+
+        except requests.exceptions.RequestException as e:
+            duration_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
+            self.logger.error(
+                "HubSpot associations request failed",
+                extra={
+                    'operation': 'get_associations',
+                    'error': str(e),
+                    'duration_ms': round(duration_ms, 2),
+                    'status_code': getattr(e.response, 'status_code', None) if hasattr(e, 'response') else None,
+                },
+                exc_info=True,
+            )
+            raise
+
     def get_data(self, 
                  access_token: str,
                  limit: int = 100, 
@@ -52,13 +222,17 @@ class APIService:
         start_time = datetime.utcnow()
         
         try:
+            object_type = kwargs.pop('object_type', None) or kwargs.pop('objectType', None)
+            search_mode = kwargs.pop('search_mode', False) or bool(object_type)
+
             self.logger.info(
                 "Starting data retrieval",
                 extra={
                     'operation': 'get_data',
                     'limit': limit,
                     'has_cursor': after is not None,
-                    'test_delay_seconds': self.test_delay_seconds
+                    'test_delay_seconds': self.test_delay_seconds,
+                    'search_mode': search_mode,
                 }
             )
             
@@ -70,9 +244,21 @@ class APIService:
                 )
                 time.sleep(self.test_delay_seconds)
             
+            if search_mode:
+                properties = kwargs.pop('properties', None)
+                filters = kwargs.pop('filters', None)
+                return self.search_objects(
+                    access_token=self._resolve_access_token(access_token),
+                    object_type=object_type,
+                    filters=filters,
+                    limit=limit,
+                    after=after,
+                    properties=properties,
+                )
+
             # Set authentication headers
             headers = {
-                'Authorization': f'Bearer {access_token}',
+                'Authorization': f'Bearer {self._resolve_access_token(access_token)}',
                 'Content-Type': 'application/json',
                 'Accept': 'application/json'
             }
